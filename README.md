@@ -58,7 +58,7 @@ cd StreamForest
 
 - Create a new environment and install the required dependencies:
 ```
-conda create --name StreamForest
+conda create --name StreamForest python=3.10
 conda activate StreamForest
 pip install -r requirements.txt
 ```
