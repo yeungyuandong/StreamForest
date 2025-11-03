@@ -1,10 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-
 import torch
 import torch.nn as nn
 from typing import Callable, Tuple
@@ -269,7 +262,7 @@ class ToMe_FSTW_PEMF(nn.Module):
         # x = x.reshape(-1, c)  # 300, 1024
         return x
 
-    def forward(self, x, local_num_frames, is_image=False): # 单帧49
+    def forward(self, x, local_num_frames, is_image=False, return_seq_ids=False): # 单帧49
         # print("is image: ", is_image)
         # raise ValueError("You are pooler!!!")
         dtype = x.dtype
@@ -288,6 +281,9 @@ class ToMe_FSTW_PEMF(nn.Module):
             num_image_tokens = image_tokens[random_number]
             x = self.merge_tokens(x, target_num_token=num_image_tokens)
             x = self.mlp(x)
+            if return_seq_ids:
+                # 图像模式不需要seq_ids，返回None
+                return x, None
             return x
         
         spatial_pos = self.get_spatial_pos_embed(new_grid_size=height, device=x.device).to(x.dtype).repeat(x.shape[0], 1, 1)
@@ -301,12 +297,15 @@ class ToMe_FSTW_PEMF(nn.Module):
         
         # memory_manager._update_long_memory()
         
-        x = memory_manager.get_memory_tokens()
+        x, seq_ids = memory_manager.get_memory_tokens()
         
         # print("<<<Mark>>> x.shape after memory: ", x.shape)
         
         x = self.mlp(x)
         # print('I am pooler', x.shape)
+        
+        if return_seq_ids:
+            return x, seq_ids  # [1, N, C], [1, N]
         return x
 
     @property

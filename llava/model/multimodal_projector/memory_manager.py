@@ -102,6 +102,12 @@ class MemoryManager(nn.Module):
         self.memory_short = []
         self.memory_long = []
         
+        # sequence id tracking for kv cache reuse
+        self.memory_now_seq_ids = []  # 每个元素对应memory_now中每个frame的token的seq_ids
+        self.memory_short_seq_ids = []  # 每个元素对应memory_short中每个frame的token的seq_ids
+        self.memory_long_seq_ids = []  # 每个元素对应memory_long中每个clip的token的seq_ids
+        self.last_output_length = 0  # 上次get_memory_tokens输出的序列长度
+        
         # long memory buffer
         self.time_buffer = []
         self.mergecnt_buffer = []
@@ -148,6 +154,48 @@ class MemoryManager(nn.Module):
             _, p, _ = x.shape
         # x = x.reshape(-1, c)  # 300, 1024
         return x
+    
+    def merge_tokens_with_seq_ids(self, x, seq_ids, target_num_token):
+        r"""
+        合并tokens同时追踪序列ID
+        x: [b, p, c] tensor
+        seq_ids: [b, p] tensor of sequence ids
+        target_num_token: int
+        返回: (merged_x, merged_seq_ids)
+        """
+        size = None
+        b, p, c = x.shape
+        tmp_p = p
+        r_merge_list = []
+        
+        if tmp_p == target_num_token:  # not compress
+            return x, seq_ids
+        
+        assert tmp_p > target_num_token, f"{tmp_p} should greater than {target_num_token}"
+        while tmp_p != target_num_token:
+            if tmp_p - target_num_token <= (tmp_p // 2):
+                r_merge_list.append(tmp_p - target_num_token)
+                break
+            else:
+                r_merge_list.append(tmp_p // 2)
+                tmp_p = tmp_p - (tmp_p // 2)
+        
+        head = self.num_attention_heads
+        dim = c // head
+        
+        for r in r_merge_list:
+            metric = x.reshape(b, p, head, dim).mean(2)  # [b, p, c//head]
+            merge, _ = bipartite_soft_matching(metric, r)
+            x, size = merge_wavg(merge, x, size)
+            
+            # 保守策略：只要发生了合并，就将所有seq_id置0
+            # 因为合并后的tokens是加权平均，内容已经改变
+            _, p_new, _ = x.shape
+            seq_ids = torch.zeros((b, p_new), dtype=torch.long, device=x.device)
+            
+            p = p_new  # 更新p为新的token数量
+        
+        return x, seq_ids
 
     def calculate_similarity_between_clips(self, clip1, clip2):
         new_clip = torch.cat([clip1, clip2], dim=0).reshape(-1, clip1.shape[-1])  # [T, C]
@@ -177,10 +225,20 @@ class MemoryManager(nn.Module):
         overflow = len(self.memory_now) - self.st_memory_windows[0]
         if overflow > 0:
             old_now_batch = self.memory_now[:overflow]
+            old_now_seq_ids_batch = self.memory_now_seq_ids[:overflow]
+            
             self.memory_now = self.memory_now[overflow:]
+            self.memory_now_seq_ids = self.memory_now_seq_ids[overflow:]
+            
             old_now_batch = torch.cat(old_now_batch, dim=0)  # [B, p, c]
-            short_tokens_batch = self.merge_tokens(old_now_batch, target_num_token=self.st_memory_tokens[1])  # [B, p', c]
+            old_now_seq_ids_batch = torch.cat(old_now_seq_ids_batch, dim=0)  # [B, p]
+            
+            short_tokens_batch, short_seq_ids_batch = self.merge_tokens_with_seq_ids(
+                old_now_batch, old_now_seq_ids_batch, target_num_token=self.st_memory_tokens[1]
+            )  # [B, p', c], [B, p']
+            
             self.memory_short.extend(t.unsqueeze(0) for t in short_tokens_batch.unbind(0))
+            self.memory_short_seq_ids.extend(s.unsqueeze(0) for s in short_seq_ids_batch.unbind(0))
         return
 
 
@@ -199,18 +257,27 @@ class MemoryManager(nn.Module):
             # print("<<<Mark>>> split_frame_idx:", split_frame_idx)
             
             old_short = torch.cat(self.memory_short[:split_frame_idx], dim=0)
+            old_short_seq_ids = torch.cat(self.memory_short_seq_ids[:split_frame_idx], dim=0)
             # print("<<<Mark>>> old_short:", old_short.shape)
             
             self.memory_short = self.memory_short[split_frame_idx:]     #删除短记忆队列中被弹出的帧
+            self.memory_short_seq_ids = self.memory_short_seq_ids[split_frame_idx:]
             self.frame_sim_buffer = self.frame_sim_buffer[split_frame_idx:]
             
             # print("<<<Mark>>> self.memory_short: ", len(self.memory_short), "self.frame_sim_buffer: ", len(self.frame_sim_buffer))
             
-            event_merged = self.merge_tokens(old_short.reshape(1, -1, self.hidden_size), self.long_memory_tokens_per_frame*old_short.shape[0]).reshape(old_short.shape[0], -1, self.hidden_size)
+            event_merged, event_seq_ids = self.merge_tokens_with_seq_ids(
+                old_short.reshape(1, -1, self.hidden_size), 
+                old_short_seq_ids.reshape(1, -1),
+                self.long_memory_tokens_per_frame * old_short.shape[0]
+            )
+            event_merged = event_merged.reshape(old_short.shape[0], -1, self.hidden_size)
+            event_seq_ids = event_seq_ids.reshape(old_short.shape[0], -1)
             # print("<<<Mark>>> event_merged ", event_merged.shape)
             
             # 初始化长记忆
             self.memory_long.append(event_merged)
+            self.memory_long_seq_ids.append(event_seq_ids)
             self.long_memory_current_tokens += event_merged.shape[0]*event_merged.shape[1]
             self.time_buffer.append((self.long_memory_last_time_pos*2 + split_frame_idx + 1)/2)
             self.long_memory_last_time_pos+=split_frame_idx
@@ -239,15 +306,27 @@ class MemoryManager(nn.Module):
             # print("<_update_long_memory> merge_idx: ", merge_idx)
             # 2. conduct merge
             clip1, clip2 = self.memory_long[merge_idx], self.memory_long[merge_idx+1]
+            clip1_seq_ids, clip2_seq_ids = self.memory_long_seq_ids[merge_idx], self.memory_long_seq_ids[merge_idx+1]
             # print("<_update_long_memory> clip1: ", clip1.shape, "clip2", clip2.shape)
+            
             merged_tokens = torch.cat([clip1, clip2], dim=0).reshape(1, -1, self.hidden_size)  # [1, T, C]
+            merged_seq_ids = torch.cat([clip1_seq_ids, clip2_seq_ids], dim=0).reshape(1, -1)  # [1, T*tokens_per_frame]
             # print("<_update_long_memory> merged_tokens before: ", merged_tokens.shape)
-            merged_tokens = self.merge_tokens(merged_tokens, self.long_memory_tokens_per_frame * math.ceil((clip1.shape[0] + clip2.shape[0])/2)).reshape(-1, self.long_memory_tokens_per_frame, self.hidden_size)  # [T', C]
+            
+            merged_tokens, merged_seq_ids = self.merge_tokens_with_seq_ids(
+                merged_tokens, 
+                merged_seq_ids,
+                self.long_memory_tokens_per_frame * math.ceil((clip1.shape[0] + clip2.shape[0])/2)
+            )
+            merged_tokens = merged_tokens.reshape(-1, self.long_memory_tokens_per_frame, self.hidden_size)  # [T', tokens_per_frame, C]
+            merged_seq_ids = merged_seq_ids.reshape(-1, self.long_memory_tokens_per_frame)  # [T', tokens_per_frame]
             # print("<_update_long_memory> merged_tokens after: ", merged_tokens.shape)
             
             
             self.memory_long[merge_idx] = merged_tokens
+            self.memory_long_seq_ids[merge_idx] = merged_seq_ids
             del self.memory_long[merge_idx+1]
+            del self.memory_long_seq_ids[merge_idx+1]
             
             self.long_memory_current_tokens -= (clip1.shape[0] + clip2.shape[0] - merged_tokens.shape[0]) * self.long_memory_tokens_per_frame
 
@@ -286,23 +365,81 @@ class MemoryManager(nn.Module):
         self.last_frame_flat = new_frame_flat
         
         new_frame_tokens = self.merge_tokens(new_frame.unsqueeze(0), self.st_memory_tokens[0])  # [1, N0, C]
+        # 新加入的帧，seq_id全部设为0 (表示需要重新计算)
+        new_frame_seq_ids = torch.zeros((1, new_frame_tokens.shape[1]), dtype=torch.long, device=new_frame.device)
+        
         self.memory_now.append(new_frame_tokens)
+        self.memory_now_seq_ids.append(new_frame_seq_ids)
 
 
     def get_memory_tokens(self):
         self._update_short_memory()
         self._update_event_split()
         self._update_long_memory()
+        
         x_all = []
+        seq_ids_all = []
+        
         if len(self.memory_long) > 0:
-            x_all.append(torch.cat(self.memory_long, dim=0).reshape(1, -1, self.hidden_size))
-            # print("<get_memory_tokens> self.memory_long: ", torch.cat(self.memory_long, dim=0).shape)
+            long_tokens = torch.cat(self.memory_long, dim=0).reshape(1, -1, self.hidden_size)
+            long_seq_ids = torch.cat(self.memory_long_seq_ids, dim=0).reshape(1, -1)
+            x_all.append(long_tokens)
+            seq_ids_all.append(long_seq_ids)
+            
         if len(self.memory_short) > 0:
-            x_all.append(torch.cat(self.memory_short, dim=0).reshape(1, -1, self.hidden_size))  # [1, N, C]
-            # print("<get_memory_tokens> self.memory_short: ", torch.cat(self.memory_short, dim=0).shape)
+            short_tokens = torch.cat(self.memory_short, dim=0).reshape(1, -1, self.hidden_size)
+            short_seq_ids = torch.cat(self.memory_short_seq_ids, dim=0).reshape(1, -1)
+            x_all.append(short_tokens)
+            seq_ids_all.append(short_seq_ids)
+            
         if len(self.memory_now) > 0:
-            x_all.append(torch.cat(self.memory_now, dim=0).reshape(1, -1, self.hidden_size))
-            # print("<get_memory_tokens> self.memory_now: ", torch.cat(self.memory_now, dim=0).shape)
-        return torch.cat(x_all, dim=1)  # [1, N_total, C]
-
-
+            now_tokens = torch.cat(self.memory_now, dim=0).reshape(1, -1, self.hidden_size)
+            now_seq_ids = torch.cat(self.memory_now_seq_ids, dim=0).reshape(1, -1)
+            x_all.append(now_tokens)
+            seq_ids_all.append(now_seq_ids)
+        
+        all_tokens = torch.cat(x_all, dim=1)  # [1, N_total, C]
+        all_seq_ids_old = torch.cat(seq_ids_all, dim=1)  # [1, N_total] - 这是从上次输出继承来的seq_ids
+        
+        # 为本次输出分配新的seq_ids（供下次使用）
+        # seq_id表示在"上次输出"中的位置，所以本次输出后要更新为"本次位置"
+        all_seq_ids_new = torch.arange(1, all_tokens.shape[1] + 1, dtype=torch.long, device=all_tokens.device).unsqueeze(0)
+        
+        # 更新last_output_length
+        self.last_output_length = all_tokens.shape[1]
+        
+        # 将新的seq_ids写回各个memory（用于下次判断是否可复用）
+        offset = 0
+        if len(self.memory_long) > 0:
+            long_len = sum([m.shape[0] * m.shape[1] for m in self.memory_long])
+            updated_long_seq_ids = all_seq_ids_new[:, offset:offset+long_len]
+            offset_within_long = 0
+            for i in range(len(self.memory_long)):
+                clip_len = self.memory_long[i].shape[0] * self.memory_long[i].shape[1]
+                self.memory_long_seq_ids[i] = updated_long_seq_ids[:, offset_within_long:offset_within_long+clip_len].reshape(
+                    self.memory_long[i].shape[0], self.memory_long[i].shape[1]
+                )
+                offset_within_long += clip_len
+            offset += long_len
+            
+        if len(self.memory_short) > 0:
+            short_len = sum([m.shape[1] for m in self.memory_short])
+            updated_short_seq_ids = all_seq_ids_new[:, offset:offset+short_len]
+            offset_within_short = 0
+            for i in range(len(self.memory_short)):
+                frame_len = self.memory_short[i].shape[1]
+                self.memory_short_seq_ids[i] = updated_short_seq_ids[:, offset_within_short:offset_within_short+frame_len]
+                offset_within_short += frame_len
+            offset += short_len
+            
+        if len(self.memory_now) > 0:
+            now_len = sum([m.shape[1] for m in self.memory_now])
+            updated_now_seq_ids = all_seq_ids_new[:, offset:offset+now_len]
+            offset_within_now = 0
+            for i in range(len(self.memory_now)):
+                frame_len = self.memory_now[i].shape[1]
+                self.memory_now_seq_ids[i] = updated_now_seq_ids[:, offset_within_now:offset_within_now+frame_len]
+                offset_within_now += frame_len
+        
+        # 返回tokens和旧的seq_ids（旧的seq_ids用于判断哪些可以复用）
+        return all_tokens, all_seq_ids_old  # [1, N_total, C], [1, N_total]
