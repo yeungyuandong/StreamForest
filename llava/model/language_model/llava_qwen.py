@@ -11,6 +11,7 @@ from transformers.generation.utils import GenerateOutput
 
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 
 # from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
@@ -136,9 +137,35 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             raise NotImplementedError("`inputs_embeds` is not supported")
         
         from llava.model.multimodal_projector.memory_manager import MemoryManager
+        from llava.model.qwen_attention import (
+            Qwen2AttentionWithPrecomputedKV, 
+            set_precomputed_kv_cache, 
+            clear_precomputed_kv_cache
+        )
         import time
         
-        # Batch推理
+        # 性能监控
+        perf_stats = {
+            'vision_encoding': 0,
+            'memory_update': 0,
+            'kv_reuse': 0,
+            'kv_new_compute': 0,
+            'kv_reassemble': 0,
+            'llm_prepare': 0,
+            'llm_generate': 0,
+            'attention_replace': 0,
+        }
+        
+        # 第一步：替换所有attention层为支持预计算KV的版本
+        attn_replace_start = time.time()
+        original_attentions = []
+        for layer_idx, layer in enumerate(self.model.layers):
+            original_attentions.append(layer.self_attn)
+            layer.self_attn = Qwen2AttentionWithPrecomputedKV(layer.self_attn, layer_idx)
+        perf_stats['attention_replace'] = time.time() - attn_replace_start
+        
+        # Batch推理vision encoder
+        vision_start = time.time()
         vision_model = self.get_model().get_vision_tower()
         all_features = []
         concat_images = images[0]
@@ -148,6 +175,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             batch_features = vision_model(batch)
             all_features.append(batch_features)
         image_features = torch.cat(all_features, dim=0)
+        perf_stats['vision_encoding'] = time.time() - vision_start
         
         # image_features=self.get_model().get_vision_tower()(images[0].unsqueeze(1))
         
@@ -206,24 +234,47 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     past_key, past_value = past_image_kv_cache[layer_idx]
                     batch_size, num_heads, _, head_dim = past_key.shape
                     
-                    # 创建新的key/value张量
-                    new_key = torch.zeros(batch_size, num_heads, current_image_token_count, head_dim, 
-                                         dtype=past_key.dtype, device=past_key.device)
-                    new_value = torch.zeros(batch_size, num_heads, current_image_token_count, head_dim,
-                                           dtype=past_value.dtype, device=past_value.device)
-                    
-                    # 填充可复用的部分
+                    # 优化: 使用index_select一次性提取可复用的tokens，减少内存分配
                     if num_reusable > 0:
-                        # 从past_key_values中提取可复用位置的KV cache，放到新位置
-                        new_key[:, :, new_positions, :] = past_key[:, :, old_positions, :]
-                        new_value[:, :, new_positions, :] = past_value[:, :, old_positions, :]
+                        # 从past KV中选择可复用的tokens
+                        reused_key = past_key.index_select(2, old_positions)  # [B, H, num_reusable, D]
+                        reused_value = past_value.index_select(2, old_positions)
                     
-                    # 填充新计算的部分
+                    # 根据情况组装新的KV cache
                     if num_new > 0 and new_image_kv_cache is not None:
                         new_token_positions = torch.where(new_token_mask)[0]
                         new_key_computed, new_value_computed = new_image_kv_cache[layer_idx]
-                        new_key[:, :, new_token_positions, :] = new_key_computed
-                        new_value[:, :, new_token_positions, :] = new_value_computed
+                        
+                        if num_reusable > 0:
+                            # 有复用 + 有新计算：需要按照正确顺序拼接
+                            # 创建索引映射来确定拼接顺序
+                            new_key = torch.empty(batch_size, num_heads, current_image_token_count, head_dim,
+                                                dtype=past_key.dtype, device=past_key.device)
+                            new_value = torch.empty(batch_size, num_heads, current_image_token_count, head_dim,
+                                                  dtype=past_value.dtype, device=past_value.device)
+                            new_key[:, :, new_positions, :] = reused_key
+                            new_value[:, :, new_positions, :] = reused_value
+                            new_key[:, :, new_token_positions, :] = new_key_computed
+                            new_value[:, :, new_token_positions, :] = new_value_computed
+                        else:
+                            # 只有新计算，直接使用
+                            new_key = new_key_computed
+                            new_value = new_value_computed
+                    else:
+                        # 只有复用，直接使用（但需要按新位置排列）
+                        if num_reusable > 0:
+                            new_key = torch.empty(batch_size, num_heads, current_image_token_count, head_dim,
+                                                dtype=past_key.dtype, device=past_key.device)
+                            new_value = torch.empty(batch_size, num_heads, current_image_token_count, head_dim,
+                                                  dtype=past_value.dtype, device=past_value.device)
+                            new_key[:, :, new_positions, :] = reused_key
+                            new_value[:, :, new_positions, :] = reused_value
+                        else:
+                            # 理论上不应该到这里（既没复用也没新计算）
+                            new_key = torch.empty(batch_size, num_heads, current_image_token_count, head_dim,
+                                                dtype=past_key.dtype, device=past_key.device)
+                            new_value = torch.empty(batch_size, num_heads, current_image_token_count, head_dim,
+                                                  dtype=past_value.dtype, device=past_value.device)
                     
                     current_image_kv_cache.append((new_key, new_value))
                 
@@ -253,29 +304,38 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             
             start_time = time.time()
             
-            # 暂时不使用past_key_values传递机制
-            # 因为HuggingFace的past_key_values是为增量解码设计的，不适合我们的场景
-            # TODO: 需要通过hook或修改forward来实现真正的KV cache复用
-            kwargs.pop("use_cache", None)
-            result = super().generate(
-                position_ids=position_ids_now, 
-                attention_mask=attention_mask_now, 
-                inputs_embeds=inputs_embeds_now, 
-                # past_key_values=past_image_kv_cache,  # 暂时注释掉
-                use_cache=True, 
-                **kwargs
-            )
+            # 第二步：设置全局KV cache，让attention层能够访问
+            set_precomputed_kv_cache(past_image_kv_cache, current_image_token_count)
+            
+            try:
+                # 调用generate，此时attention层会使用预计算的KV cache
+                kwargs.pop("use_cache", None)
+                result = super().generate(
+                    position_ids=position_ids_now, 
+                    attention_mask=attention_mask_now, 
+                    inputs_embeds=inputs_embeds_now,
+                    use_cache=True, 
+                    **kwargs
+                )
+            finally:
+                # 第三步：清理全局KV cache
+                clear_precomputed_kv_cache()
             
             end_time = time.time()
             
             elapsed_time = end_time - start_time
             print(f"\n <<< LLM inference time: {elapsed_time:.3f} seconds >>> ")
+            print(f"    已复用 {current_image_token_count} 个image tokens的KV cache")
             
             print("result at frame", frame_idx,":", result)
             
             # 更新状态，为下一轮做准备
             last_seq_ids = seq_ids_now
             last_image_token_count = current_image_token_count
+        
+        # 第四步：恢复原始的attention层
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer.self_attn = original_attentions[layer_idx]
         
         return result
 
