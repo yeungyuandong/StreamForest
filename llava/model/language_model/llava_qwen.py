@@ -246,20 +246,22 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             image_features_now_embeds = self.get_model().mm_projector.mlp(image_features_now)
             (inputs_now, position_ids_now, attention_mask_now, _, inputs_embeds_now, _) = self.prepare_inputs_labels_for_LLM(
                 inputs, position_ids, attention_mask, None, None, images, 
-                [image_features_now], modalities, image_sizes=image_sizes
+                [image_features_now_embeds], modalities, image_sizes=image_sizes
             )
 
             # print("inputs_embeds to llm: ", inputs_embeds_now.shape)
             
             start_time = time.time()
             
-            # 注意：这里传入的past_key_values只包含image tokens的部分
-            # generate过程中会扩展这个cache
+            # 暂时不使用past_key_values传递机制
+            # 因为HuggingFace的past_key_values是为增量解码设计的，不适合我们的场景
+            # TODO: 需要通过hook或修改forward来实现真正的KV cache复用
+            kwargs.pop("use_cache", None)
             result = super().generate(
                 position_ids=position_ids_now, 
                 attention_mask=attention_mask_now, 
                 inputs_embeds=inputs_embeds_now, 
-                past_key_values=past_image_kv_cache,  # 传入复用的image KV cache
+                # past_key_values=past_image_kv_cache,  # 暂时注释掉
                 use_cache=True, 
                 **kwargs
             )
