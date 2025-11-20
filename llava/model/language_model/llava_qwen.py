@@ -325,24 +325,31 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             
             start_time = time.time()
             
-            # 调用generate，对于有KV cache复用的情况传入past_key_values
-            if reuse_length > 0:
-                # 传入新增部分的inputs_embeds + 复用的past_key_values
-                result = super().generate(
-                    inputs_embeds=inputs_embeds_new,
-                    past_key_values=tuple(past_key_values_reused),
-                    position_ids=position_ids_new,
-                    attention_mask=attention_mask_new,
-                    **kwargs
-                )
-            else:
-                # 无复用，传入完整的inputs_embeds
-                result = super().generate(
-                    inputs_embeds=inputs_embeds_now,
-                    position_ids=position_ids_now,
-                    attention_mask=attention_mask_now,
-                    **kwargs
-                )
+            # 使用model的forward来获取KV cache
+            # 注意：如果使用了past_key_values，需要确保格式正确（tuple而不是list）
+            pkv_to_use = None
+            if reuse_length > 0 and past_key_values_reused is not None:
+                pkv_to_use = tuple(past_key_values_reused)
+            
+            outputs = self.model(
+                inputs_embeds=inputs_embeds_new,
+                attention_mask=attention_mask_new,
+                position_ids=position_ids_new,
+                past_key_values=pkv_to_use,
+                use_cache=True,
+                return_dict=True
+            )
+            
+            # 获取logits
+            hidden_states = outputs.last_hidden_state
+            logits = self.lm_head(hidden_states)
+            
+            # 取最后一个token的logits并生成（这里简化为greedy decoding生成1个token）
+            next_token_logits = logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # 构造result - 只返回生成的token（与原generate_online格式保持一致）
+            result = next_token
             
             end_time = time.time()
             elapsed_time = end_time - start_time
@@ -352,19 +359,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             if reuse_length > 0:
                 total_tokens_saved += reuse_length
             
-            # 保存当前inputs_embeds和完整KV cache用于下一轮复用
+            # 保存当前的inputs_embeds和KV cache用于下一轮
             prev_inputs_embeds = inputs_embeds_now
-            
-            # 计算完整序列的KV cache（用于下一轮）
-            with torch.no_grad():
-                cache_outputs = self.model(
-                    inputs_embeds=inputs_embeds_now,
-                    attention_mask=attention_mask_now,
-                    position_ids=position_ids_now,
-                    use_cache=True,
-                    return_dict=True
-                )
-                cached_kv = cache_outputs.past_key_values
+            cached_kv = outputs.past_key_values
+            cached_past_length = inputs_embeds_now.shape[1]
             
             print(f"<<< LLM inference time: {elapsed_time:.3f} seconds >>>")
             print(f"Result at frame {frame_idx}: {result}")
